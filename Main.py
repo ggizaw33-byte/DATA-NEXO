@@ -1,11 +1,11 @@
-# ɴᴇXᴏ SᴛᴏƦᴇ V12 FIXED
-# ɴᴇXᴏ SᴛᴏƦᴇ VERSION V12
+# ɴᴇXᴏ SᴛᴏƦᴇ V13 POWER UPGRADE
+# ɴᴇXᴏ SᴛᴏƦᴇ VERSION V11
 # ============================================================
-# ɴᴇXᴏ SᴛᴏƦᴇ - Native Python Telegram Bot | VERSION 12
+# ɴᴇXᴏ SᴛᴏƦᴇ - Native Python Telegram Bot | VERSION 10
 # Converted from NEXO_STORE_TPY_FIXED_5000PLUS.txt
 #
 # Library: pyTelegramBotAPI (telebot)
-# Storage: Supabase PostgreSQL
+# Storage: SQLite
 #
 # Install:
 #   pip install pyTelegramBotAPI
@@ -23,13 +23,12 @@ import os
 import html
 import psycopg2
 from psycopg2.extras import RealDictCursor
-from psycopg2.pool import ThreadedConnectionPool
-from psycopg2 import extensions
 import secrets
 import time
 import logging
 from urllib.parse import quote
 import json
+import re
 from urllib.parse import urlparse
 from datetime import datetime, timezone
 from threading import Lock
@@ -105,17 +104,11 @@ if not BOT_TOKEN:
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 db_lock = Lock()
 
-# V12 in-memory caches for values that are read on almost every UI action.
-_button_theme_cache = "primary"
-_button_theme_cache_loaded = False
-_group_permission_cache = {"at": 0.0, "ok": None, "reason": ""}
-_group_permission_cache_lock = Lock()
-
 # Telegram Bot API supports real inline-button styles: primary (blue),
 # success (green), and danger (red). Gold is mapped to primary because it is
 # not an official Bot API button style.
 def Button(text, **kwargs):
-    theme = str(_get_button_theme()).lower()
+    theme = str(get_setting("button_theme", "primary")).lower() if "get_setting" in globals() else "primary"
     style = {
         "blue": "primary", "primary": "primary",
         "green": "success", "success": "success",
@@ -147,49 +140,28 @@ logging.basicConfig(
 
 SUPABASE_DB_URL = os.getenv("SUPABASE_DB_URL", "").strip()
 
-# V12 performance: reuse PostgreSQL connections instead of opening a new
-# Supabase connection for every small database operation.
-DB_POOL = None
-DB_POOL_LOCK = Lock()
-DB_POOL_MIN = max(1, int(os.getenv("NEXO_DB_POOL_MIN", "1")))
-DB_POOL_MAX = max(DB_POOL_MIN, int(os.getenv("NEXO_DB_POOL_MAX", "15")))
 
-def _get_db_pool():
-    global DB_POOL
-    if DB_POOL is not None:
-        return DB_POOL
+def db():
     if not SUPABASE_DB_URL:
         raise SystemExit(
             "SUPABASE_DB_URL is not set.\n"
             "Set it to your Supabase PostgreSQL connection string."
         )
-    with DB_POOL_LOCK:
-        if DB_POOL is None:
-            DB_POOL = ThreadedConnectionPool(
-                DB_POOL_MIN,
-                DB_POOL_MAX,
-                dsn=SUPABASE_DB_URL,
-                sslmode="require",
-            )
-    return DB_POOL
-
-
-def db():
-    """Get a pooled PostgreSQL connection. close() returns it to the pool."""
-    pool = _get_db_pool()
-    return _PostgresConnection(pool, pool.getconn())
+    conn = psycopg2.connect(SUPABASE_DB_URL, sslmode="require")
+    return _PostgresConnection(conn)
 
 
 class _PostgresConnection:
-    """Compatibility wrapper around a pooled psycopg2 connection."""
+    """Small compatibility wrapper so the existing bot SQL can keep using
+    conn.execute(...), fetchone(), fetchall(), and '?' placeholders.
+    """
 
-    def __init__(self, pool, conn):
-        self._pool = pool
+    def __init__(self, conn):
         self._conn = conn
-        self._closed = False
 
     @staticmethod
     def _sql(sql):
+        # Existing Main.py uses SQLite-style '?' placeholders.
         return sql.replace("?", "%s")
 
     def execute(self, sql, params=None):
@@ -207,26 +179,8 @@ class _PostgresConnection:
         self._conn.rollback()
 
     def close(self):
-        if self._closed:
-            return
-        self._closed = True
-        try:
-            # Never return an aborted transaction to the pool.
-            if self._conn.status != extensions.STATUS_READY:
-                self._conn.rollback()
-        except Exception:
-            try:
-                self._conn.close()
-                return
-            except Exception:
-                return
-        try:
-            self._pool.putconn(self._conn)
-        except Exception:
-            try:
-                self._conn.close()
-            except Exception:
-                pass
+        self._conn.close()
+
 
 def init_db():
     """Initialize/verify the Supabase schema and seed application defaults.
@@ -368,7 +322,7 @@ def init_db():
                     amount NUMERIC NOT NULL DEFAULT 0,
                     max_claims INTEGER NOT NULL DEFAULT 1,
                     claims_count INTEGER NOT NULL DEFAULT 0,
-                    active BOOLEAN NOT NULL DEFAULT TRUE,
+                    active INTEGER NOT NULL DEFAULT 1,
                     created_by TEXT DEFAULT '',
                     created_at TEXT
                 )
@@ -499,25 +453,6 @@ def admin_ids():
         conn.close()
     return [str(r["user_id"]) for r in rows]
 
-def _get_button_theme():
-    global _button_theme_cache, _button_theme_cache_loaded
-    if _button_theme_cache_loaded:
-        return _button_theme_cache
-    try:
-        with db_lock:
-            conn = db()
-            row = conn.execute(
-                "SELECT value FROM settings WHERE key=?",
-                ("button_theme",)
-            ).fetchone()
-            conn.close()
-        _button_theme_cache = row["value"] if row else "primary"
-    except Exception:
-        _button_theme_cache = "primary"
-    _button_theme_cache_loaded = True
-    return _button_theme_cache
-
-
 def get_setting(key, default=""):
     with db_lock:
         conn = db()
@@ -538,10 +473,6 @@ def set_setting(key, value):
         )
         conn.commit()
         conn.close()
-    if key == "button_theme":
-        global _button_theme_cache, _button_theme_cache_loaded
-        _button_theme_cache = str(value)
-        _button_theme_cache_loaded = True
 
 def ensure_user(user):
     uid = str(user.id)
@@ -722,7 +653,7 @@ def button_theme_prefix(theme):
 
 def build_url_button(text, url):
     kb = types.InlineKeyboardMarkup()
-    theme = _get_button_theme()
+    theme = get_setting("button_theme", "primary")
     style = {"blue":"primary", "primary":"primary", "green":"success", "success":"success", "red":"danger", "danger":"danger", "gold":"primary"}.get(theme, "primary")
     kb.add(Button(text, url=url, style=style))
     return kb
@@ -747,15 +678,8 @@ def group_log_keyboard():
     return build_url_button("🏪 OPEN STORE", BOT_URL)
 
 
-def check_group_permissions(force=False):
-    """Check group permissions, but cache the Telegram API result briefly."""
-    import time as _time
-    now_ts = _time.monotonic()
-    with _group_permission_cache_lock:
-        if (not force and _group_permission_cache["ok"] is not None
-                and now_ts - _group_permission_cache["at"] < 300):
-            return _group_permission_cache["ok"], _group_permission_cache["reason"]
-
+def check_group_permissions():
+    """Verify that the bot can post in the configured group."""
     try:
         me = bot.get_me()
         member = bot.get_chat_member(MAIN_GROUP, me.id)
@@ -763,23 +687,16 @@ def check_group_permissions(force=False):
         if status in ("creator", "administrator"):
             can_post = getattr(member, "can_post_messages", None)
             if can_post is False:
-                result = (False, "Bot is an admin but does not have permission to post messages.")
-            else:
-                result = (True, "OK")
-        elif status in ("member", "restricted"):
+                return False, "Bot is an admin but does not have permission to post messages."
+            return True, "OK"
+        if status in ("member", "restricted"):
             can_send = getattr(member, "can_send_messages", None)
-            result = ((False, "Bot is not allowed to send messages in the group.")
-                      if can_send is False else (True, "OK"))
-        else:
-            result = (False, f"Bot membership status is {status or 'unknown'}. Add the bot to the group and make it an admin.")
+            if can_send is False:
+                return False, "Bot is not allowed to send messages in the group."
+            return True, "OK"
+        return False, f"Bot membership status is {status or 'unknown'}. Add the bot to the group and make it an admin."
     except Exception as e:
-        result = (False, str(e))
-
-    with _group_permission_cache_lock:
-        _group_permission_cache["at"] = now_ts
-        _group_permission_cache["ok"] = result[0]
-        _group_permission_cache["reason"] = result[1]
-    return result
+        return False, str(e)
 
 def post_to_main_group(text, reply_markup=None, photo=None):
     """Post text/photo to MAIN_GROUP after checking bot permissions."""
@@ -1136,6 +1053,21 @@ def v11_send_settings(chat_id):
 # V11 TEXT STATES
 # =========================
 
+def v11_normalize_public_chat(raw):
+    """Normalize a public Telegram @username/t.me link to a chat identifier."""
+    value = str(raw or "").strip()
+    value = value.split("#", 1)[0].split("?", 1)[0].strip().rstrip("/")
+    if value.startswith("@"):
+        username = value[1:]
+    else:
+        m = re.match(r"^(?:https?://)?(?:www\.)?t\.me/([A-Za-z0-9_]{5,32})(?:/.*)?$", value, re.I)
+        if not m:
+            return ""
+        username = m.group(1)
+    if not re.fullmatch(r"[A-Za-z0-9_]{5,32}", username):
+        return ""
+    return "@" + username
+
 def v11_handle_text_state(message):
     uid = message.from_user.id
     state, state_data = get_state(uid)
@@ -1148,13 +1080,10 @@ def v11_handle_text_state(message):
 
     if state == "v11_add_channel":
         raw = str(message.text or "").strip()
-        if not raw:
-            bot.reply_to(message, "❌ Invalid channel.")
+        normalized = v11_normalize_public_chat(raw)
+        if not normalized:
+            bot.reply_to(message, "❌ Invalid input. Send a public @username or https://t.me/username.")
             return True
-        if not (raw.startswith("@") or "t.me/" in raw):
-            bot.reply_to(message, "❌ Send @username or a public t.me link for a Channel, Group, or Supergroup.")
-            return True
-        normalized = raw.rstrip("/")
         try:
             chat = bot.get_chat(normalized)
             chat_type = str(getattr(chat, "type", ""))
@@ -2521,10 +2450,62 @@ def admin_statistics(chat_id):
         reply_markup=back_admin()
     )
 
+def admin_usdt_dashboard(chat_id):
+    """Powerful USDT admin center: rates, wallet, order counters and quick actions."""
+    buy = safe_float(get_setting("usdt_buy_rate", "0"))
+    sell = safe_float(get_setting("usdt_sell_rate", "0"))
+    address = str(get_setting("usdt_sell_address", "")).strip()
+    with db_lock:
+        conn = db()
+        pending = conn.execute("SELECT COUNT(*) AS c FROM transactions WHERE type IN ('usdt_buy','usdt_sell') AND status='pending'").fetchone()["c"]
+        approved = conn.execute("SELECT COUNT(*) AS c FROM transactions WHERE type IN ('usdt_buy','usdt_sell') AND status='approved'").fetchone()["c"]
+        rejected = conn.execute("SELECT COUNT(*) AS c FROM transactions WHERE type IN ('usdt_buy','usdt_sell') AND status='rejected'").fetchone()["c"]
+        conn.close()
+
+    kb = types.InlineKeyboardMarkup()
+    kb.row(Button("💵 BUY RATE", callback_data="set_usdt_buy_rate"), Button("💵 SELL RATE", callback_data="set_usdt_sell_rate"))
+    kb.add(Button("📤 SELL WALLET / ADDRESS", callback_data="set_usdt_sell_address"))
+    kb.add(Button("⏳ PENDING USDT ORDERS", callback_data="admin_usdt_pending"))
+    kb.row(Button("✅ APPROVED", callback_data="admin_usdt_approved"), Button("❌ REJECTED", callback_data="admin_usdt_rejected"))
+    kb.add(Button("🔄 REFRESH", callback_data="admin_usdt_dashboard"))
+    kb.add(Button("🔙 PAYMENT SETTINGS", callback_data="admin_payment_settings"))
+
+    wallet = esc(address) if address else "<i>Not configured</i>"
+    text = (
+        "💵 <b>USDT CONTROL CENTER</b>\n\n"
+        f"🟢 Buy Rate: <b>{money(buy)}</b> ETB / USDT\n"
+        f"🔴 Sell Rate: <b>{money(sell)}</b> ETB / USDT\n"
+        f"📤 Sell Wallet: <code>{wallet}</code>\n\n"
+        f"⏳ Pending: <b>{pending}</b>\n"
+        f"✅ Approved: <b>{approved}</b>\n"
+        f"❌ Rejected: <b>{rejected}</b>\n\n"
+        "⚡ Use the controls below to manage rates, wallet and USDT requests."
+    )
+    bot.send_message(chat_id, text, reply_markup=kb)
+
+
+def admin_usdt_orders(chat_id, status):
+    title = {"pending":"⏳ PENDING", "approved":"✅ APPROVED", "rejected":"❌ REJECTED"}.get(status, status.upper())
+    with db_lock:
+        conn = db()
+        rows = conn.execute("SELECT * FROM transactions WHERE type IN ('usdt_buy','usdt_sell') AND status=? ORDER BY created_at DESC LIMIT 30", (status,)).fetchall()
+        conn.close()
+    if not rows:
+        bot.send_message(chat_id, f"💵 <b>USDT {title}</b>\n\nNo orders found.", reply_markup=back_admin())
+        return
+    text = f"💵 <b>USDT {title} ORDERS</b>\n\n"
+    for r in rows:
+        text += (f"🧾 <code>{esc(r['id'])}</code> | <b>{esc(r['type'])}</b>\n"
+                 f"👤 <code>{esc(r['user_id'])}</code> | 💵 {money(r['amount'])} USDT | 💰 {money(r['total'])} ETB\n"
+                 f"🕐 {esc(r['created_at'])}\n\n")
+    bot.send_message(chat_id, text, reply_markup=back_admin())
+
+
 def admin_payment_settings(chat_id):
     kb = types.InlineKeyboardMarkup()
     kb.add(Button("📱 SET TELEBIRR NUMBER", callback_data="set_payment_phone"))
     kb.add(Button("👤 SET ACCOUNT MANAGER", callback_data="set_payment_manager"))
+    kb.add(Button("💵 USDT CONTROL CENTER", callback_data="admin_usdt_dashboard"))
     kb.add(Button("📤 SET USDT SELL ADDRESS", callback_data="set_usdt_sell_address"))
     kb.row(
         Button("💵 BUY RATE", callback_data="set_usdt_buy_rate"),
@@ -2568,7 +2549,7 @@ def admin_settings(chat_id):
     kb.add(Button("🚀 V11 SETTINGS", callback_data="v11_settings", style="primary"))
 
     enabled = "ON" if get_setting("group_log_enabled", "1") == "1" else "OFF"
-    theme = _get_button_theme().upper()
+    theme = get_setting("button_theme", "primary").upper()
     bot.send_message(
         chat_id,
         "⚙️ <b>SYSTEM SETTINGS</b>\n\n"
@@ -2667,6 +2648,13 @@ def text_handler(message):
         return
 
     state, data = get_state(uid)
+
+    # IMPORTANT: V11 admin text states must be consumed before Force Join or
+    # any normal text workflow. This prevents an entered channel link/username
+    # from falling through to Home.
+    if state in ("v11_add_channel", "v11_welcome"):
+        if v11_handle_text_state(message):
+            return
 
     # Normal users must satisfy Force Join before using the store. Admins bypass it.
     if not is_admin(uid) and v11_force_join_enabled() and not v11_all_channels_joined(uid):
@@ -2791,7 +2779,7 @@ def text_handler(message):
                     return
                 conn.execute(
                     "INSERT INTO redeem_codes(code,amount,max_claims,claims_count,active,created_by,created_at) VALUES(?,?,?,?,?,?,?)",
-                    (code, amount, limit, 0, True, str(uid), now())
+                    (code, amount, limit, 0, 1, str(uid), now())
                 )
                 conn.commit()
                 conn.close()
@@ -4328,6 +4316,22 @@ def callbacks(call):
         admin_payment_settings(chat_id)
         return
 
+    if data == "admin_usdt_dashboard":
+        admin_usdt_dashboard(chat_id)
+        return
+
+    if data == "admin_usdt_pending":
+        admin_usdt_orders(chat_id, "pending")
+        return
+
+    if data == "admin_usdt_approved":
+        admin_usdt_orders(chat_id, "approved")
+        return
+
+    if data == "admin_usdt_rejected":
+        admin_usdt_orders(chat_id, "rejected")
+        return
+
     if data == "set_payment_phone":
         set_state(uid, "payment_phone")
         bot.send_message(chat_id, "📱 Send the Telebirr payment number.")
@@ -5015,10 +5019,16 @@ def v11_settings_entry_callback(call):
 
 if __name__ == "__main__":
     init_db()
-    logging.info("ɴᴇXᴏ SᴛᴏƦᴇ Python bot VERSION 12 FAST/FIXED starting...")
+    logging.info("ɴᴇXᴏ SᴛᴏƦᴇ Python bot VERSION 11 starting...")
     logging.info("Master admin: %s", MASTER_ADMIN)
     logging.info("Main group: %s", MAIN_GROUP)
+    logging.info("USDT Control Center: enabled")
+    logging.info("V11 Force Join state router: hardened")
+    # skip_pending prevents a large backlog after redeploy. If Telegram reports
+    # 409 Conflict, another process is using the same token and must be stopped.
     bot.infinity_polling(
         skip_pending=True,
-        allowed_updates=["message", "callback_query"]
+        allowed_updates=["message", "callback_query"],
+        timeout=30,
+        long_polling_timeout=30
     )
