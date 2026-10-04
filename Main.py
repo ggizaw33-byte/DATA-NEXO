@@ -1,11 +1,11 @@
-#b# ɴᴇXᴏ SᴛᴏƦᴇ V11 FIXED
-# ɴᴇXᴏ SᴛᴏƦᴇ VERSION V11
+# ɴᴇXᴏ SᴛᴏƦᴇ V12 FIXED
+# ɴᴇXᴏ SᴛᴏƦᴇ VERSION V12
 # ============================================================
-# ɴᴇXᴏ SᴛᴏƦᴇ - Native Python Telegram Bot | VERSION 10
+# ɴᴇXᴏ SᴛᴏƦᴇ - Native Python Telegram Bot | VERSION 12
 # Converted from NEXO_STORE_TPY_FIXED_5000PLUS.txt
 #
 # Library: pyTelegramBotAPI (telebot)
-# Storage: SQLite
+# Storage: Supabase PostgreSQL
 #
 # Install:
 #   pip install pyTelegramBotAPI
@@ -23,6 +23,8 @@ import os
 import html
 import psycopg2
 from psycopg2.extras import RealDictCursor
+from psycopg2.pool import ThreadedConnectionPool
+from psycopg2 import extensions
 import secrets
 import time
 import logging
@@ -103,11 +105,17 @@ if not BOT_TOKEN:
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 db_lock = Lock()
 
+# V12 in-memory caches for values that are read on almost every UI action.
+_button_theme_cache = "primary"
+_button_theme_cache_loaded = False
+_group_permission_cache = {"at": 0.0, "ok": None, "reason": ""}
+_group_permission_cache_lock = Lock()
+
 # Telegram Bot API supports real inline-button styles: primary (blue),
 # success (green), and danger (red). Gold is mapped to primary because it is
 # not an official Bot API button style.
 def Button(text, **kwargs):
-    theme = str(get_setting("button_theme", "primary")).lower() if "get_setting" in globals() else "primary"
+    theme = str(_get_button_theme()).lower()
     style = {
         "blue": "primary", "primary": "primary",
         "green": "success", "success": "success",
@@ -139,28 +147,49 @@ logging.basicConfig(
 
 SUPABASE_DB_URL = os.getenv("SUPABASE_DB_URL", "").strip()
 
+# V12 performance: reuse PostgreSQL connections instead of opening a new
+# Supabase connection for every small database operation.
+DB_POOL = None
+DB_POOL_LOCK = Lock()
+DB_POOL_MIN = max(1, int(os.getenv("NEXO_DB_POOL_MIN", "1")))
+DB_POOL_MAX = max(DB_POOL_MIN, int(os.getenv("NEXO_DB_POOL_MAX", "15")))
 
-def db():
+def _get_db_pool():
+    global DB_POOL
+    if DB_POOL is not None:
+        return DB_POOL
     if not SUPABASE_DB_URL:
         raise SystemExit(
             "SUPABASE_DB_URL is not set.\n"
             "Set it to your Supabase PostgreSQL connection string."
         )
-    conn = psycopg2.connect(SUPABASE_DB_URL, sslmode="require")
-    return _PostgresConnection(conn)
+    with DB_POOL_LOCK:
+        if DB_POOL is None:
+            DB_POOL = ThreadedConnectionPool(
+                DB_POOL_MIN,
+                DB_POOL_MAX,
+                dsn=SUPABASE_DB_URL,
+                sslmode="require",
+            )
+    return DB_POOL
+
+
+def db():
+    """Get a pooled PostgreSQL connection. close() returns it to the pool."""
+    pool = _get_db_pool()
+    return _PostgresConnection(pool, pool.getconn())
 
 
 class _PostgresConnection:
-    """Small compatibility wrapper so the existing bot SQL can keep using
-    conn.execute(...), fetchone(), fetchall(), and '?' placeholders.
-    """
+    """Compatibility wrapper around a pooled psycopg2 connection."""
 
-    def __init__(self, conn):
+    def __init__(self, pool, conn):
+        self._pool = pool
         self._conn = conn
+        self._closed = False
 
     @staticmethod
     def _sql(sql):
-        # Existing Main.py uses SQLite-style '?' placeholders.
         return sql.replace("?", "%s")
 
     def execute(self, sql, params=None):
@@ -178,8 +207,26 @@ class _PostgresConnection:
         self._conn.rollback()
 
     def close(self):
-        self._conn.close()
-
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            # Never return an aborted transaction to the pool.
+            if self._conn.status != extensions.STATUS_READY:
+                self._conn.rollback()
+        except Exception:
+            try:
+                self._conn.close()
+                return
+            except Exception:
+                return
+        try:
+            self._pool.putconn(self._conn)
+        except Exception:
+            try:
+                self._conn.close()
+            except Exception:
+                pass
 
 def init_db():
     """Initialize/verify the Supabase schema and seed application defaults.
@@ -452,6 +499,25 @@ def admin_ids():
         conn.close()
     return [str(r["user_id"]) for r in rows]
 
+def _get_button_theme():
+    global _button_theme_cache, _button_theme_cache_loaded
+    if _button_theme_cache_loaded:
+        return _button_theme_cache
+    try:
+        with db_lock:
+            conn = db()
+            row = conn.execute(
+                "SELECT value FROM settings WHERE key=?",
+                ("button_theme",)
+            ).fetchone()
+            conn.close()
+        _button_theme_cache = row["value"] if row else "primary"
+    except Exception:
+        _button_theme_cache = "primary"
+    _button_theme_cache_loaded = True
+    return _button_theme_cache
+
+
 def get_setting(key, default=""):
     with db_lock:
         conn = db()
@@ -472,6 +538,10 @@ def set_setting(key, value):
         )
         conn.commit()
         conn.close()
+    if key == "button_theme":
+        global _button_theme_cache, _button_theme_cache_loaded
+        _button_theme_cache = str(value)
+        _button_theme_cache_loaded = True
 
 def ensure_user(user):
     uid = str(user.id)
@@ -652,7 +722,7 @@ def button_theme_prefix(theme):
 
 def build_url_button(text, url):
     kb = types.InlineKeyboardMarkup()
-    theme = get_setting("button_theme", "primary")
+    theme = _get_button_theme()
     style = {"blue":"primary", "primary":"primary", "green":"success", "success":"success", "red":"danger", "danger":"danger", "gold":"primary"}.get(theme, "primary")
     kb.add(Button(text, url=url, style=style))
     return kb
@@ -677,8 +747,15 @@ def group_log_keyboard():
     return build_url_button("🏪 OPEN STORE", BOT_URL)
 
 
-def check_group_permissions():
-    """Verify that the bot can post in the configured group."""
+def check_group_permissions(force=False):
+    """Check group permissions, but cache the Telegram API result briefly."""
+    import time as _time
+    now_ts = _time.monotonic()
+    with _group_permission_cache_lock:
+        if (not force and _group_permission_cache["ok"] is not None
+                and now_ts - _group_permission_cache["at"] < 300):
+            return _group_permission_cache["ok"], _group_permission_cache["reason"]
+
     try:
         me = bot.get_me()
         member = bot.get_chat_member(MAIN_GROUP, me.id)
@@ -686,16 +763,23 @@ def check_group_permissions():
         if status in ("creator", "administrator"):
             can_post = getattr(member, "can_post_messages", None)
             if can_post is False:
-                return False, "Bot is an admin but does not have permission to post messages."
-            return True, "OK"
-        if status in ("member", "restricted"):
+                result = (False, "Bot is an admin but does not have permission to post messages.")
+            else:
+                result = (True, "OK")
+        elif status in ("member", "restricted"):
             can_send = getattr(member, "can_send_messages", None)
-            if can_send is False:
-                return False, "Bot is not allowed to send messages in the group."
-            return True, "OK"
-        return False, f"Bot membership status is {status or 'unknown'}. Add the bot to the group and make it an admin."
+            result = ((False, "Bot is not allowed to send messages in the group.")
+                      if can_send is False else (True, "OK"))
+        else:
+            result = (False, f"Bot membership status is {status or 'unknown'}. Add the bot to the group and make it an admin.")
     except Exception as e:
-        return False, str(e)
+        result = (False, str(e))
+
+    with _group_permission_cache_lock:
+        _group_permission_cache["at"] = now_ts
+        _group_permission_cache["ok"] = result[0]
+        _group_permission_cache["reason"] = result[1]
+    return result
 
 def post_to_main_group(text, reply_markup=None, photo=None):
     """Post text/photo to MAIN_GROUP after checking bot permissions."""
@@ -2484,7 +2568,7 @@ def admin_settings(chat_id):
     kb.add(Button("🚀 V11 SETTINGS", callback_data="v11_settings", style="primary"))
 
     enabled = "ON" if get_setting("group_log_enabled", "1") == "1" else "OFF"
-    theme = get_setting("button_theme", "primary").upper()
+    theme = _get_button_theme().upper()
     bot.send_message(
         chat_id,
         "⚙️ <b>SYSTEM SETTINGS</b>\n\n"
@@ -4931,7 +5015,7 @@ def v11_settings_entry_callback(call):
 
 if __name__ == "__main__":
     init_db()
-    logging.info("ɴᴇXᴏ SᴛᴏƦᴇ Python bot VERSION 11 starting...")
+    logging.info("ɴᴇXᴏ SᴛᴏƦᴇ Python bot VERSION 12 FAST/FIXED starting...")
     logging.info("Master admin: %s", MASTER_ADMIN)
     logging.info("Main group: %s", MAIN_GROUP)
     bot.infinity_polling(
