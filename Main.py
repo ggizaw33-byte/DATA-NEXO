@@ -31,7 +31,22 @@ import json
 from urllib.parse import urlparse
 from datetime import datetime, timezone
 from threading import Lock
+from flask import Flask
+from threading import Thread
 
+app = Flask(__name__)
+
+@app.route("/")
+def home():
+    return "NEXO STORE Bot is running!"
+
+def run_web():
+    app.run(
+        host="0.0.0.0",
+        port=int(os.environ.get("PORT", 10000))
+    )
+
+Thread(target=run_web, daemon=True).start()
 import telebot
 from telebot import types
 
